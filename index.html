@@ -149,7 +149,6 @@ function cellAt(c,r){
   if(c<0||r<0||c>=COLS||r>=ROWS) return T.STEEL;
   return grid[r][c];
 }
-function solidForTile(t){ return t===T.BRICK||t===T.STEEL||t===T.WATER||t===T.EAGLE; }
 function freeCell(c,r){ return grid[r][c]===T.EMPTY; }
 
 /* ===================== 关卡加载 ===================== */
@@ -185,7 +184,7 @@ function loadLevel(n){
   // 玩家
   const prevStar=player?player.star:0;
   const sx=freeCell(4,12)?4:8;
-  player={cx:sx*CELL+CELL/2, cy:12*CELL+CELL/2, dir:D.UP, star:prevStar, cd:0, alive:true, deadT:0};
+  player={cx:sx*CELL+CELL/2, cy:12*CELL+CELL/2, dir:D.UP, star:prevStar, speed:140, cd:0, alive:true, deadT:0};
   enemies=[]; bullets=[]; powerups=[]; parts=[]; floats=[];
   spawned=0; destroyed=0; baseDead=false;
   spawnQ=buildQueue(n); spawnTimer=0.9;
@@ -214,7 +213,7 @@ function spawnEnemy(){
   const flash=spawned+1===4||spawned+1===11||spawned+1===18; // 第 4/11/18 辆会掉落道具
   enemies.push({
     type, cfg, cx:x, cy:-8, dir:D.DOWN, hp:cfg.hp, speed:cfg.speed,
-    cd:1+Math.random(), think:0.5+Math.random(), stuck:0,
+    cd:1+Math.random(), think:0.5+Math.random(), stuck:0, lastBlocked:undefined,
     spawning:true, spawnT:1.1, flash, dead:false,
   });
   spawned++;
@@ -222,14 +221,22 @@ function spawnEnemy(){
 }
 
 /* ===================== 移动与碰撞 ===================== */
-function tankHitsWall(t){
+// 坦克占位判定: 检查四角+四边中点, 砖墙按"四分之一块"级别判定(半毁的砖格可通行)
+function tankBlockedAt(cx,cy){
   const h=18;
-  const c0=Math.floor((t.cx-h)/CELL), c1=Math.floor((t.cx+h)/CELL);
-  const r0=Math.floor((t.cy-h)/CELL), r1=Math.floor((t.cy+h)/CELL);
-  for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++)
-    if(solidForTile(cellAt(c,r))) return true;
+  const pts=[[cx-h,cy-h],[cx,cy-h],[cx+h,cy-h],[cx+h,cy],[cx+h,cy+h],[cx,cy+h],[cx-h,cy+h],[cx-h,cy]];
+  for(const [px,py] of pts){
+    const c=Math.floor(px/CELL), r=Math.floor(py/CELL);
+    const tile=cellAt(c,r);
+    if(tile===T.STEEL||tile===T.WATER||tile===T.EAGLE) return true;
+    if(tile===T.BRICK){
+      const qx=(px-c*CELL)<CELL/2?0:1, qy=(py-r*CELL)<CELL/2?0:1;
+      if(brickMask[r][c]&(1<<(qy*2+qx))) return true;
+    }
+  }
   return false;
 }
+function tankHitsWall(t){ return tankBlockedAt(t.cx,t.cy); }
 
 function tankCollide(t){
   if(tankHitsWall(t)) return true;
@@ -257,13 +264,7 @@ function moveTank(t,dt){
 }
 
 function canStep(t,d){
-  const h=18, step=20;
-  const nx=t.cx+DX[d]*step, ny=t.cy+DY[d]*step;
-  const c0=Math.floor((nx-h)/CELL), c1=Math.floor((nx+h)/CELL);
-  const r0=Math.floor((ny-h)/CELL), r1=Math.floor((ny+h)/CELL);
-  for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++)
-    if(solidForTile(cellAt(c,r))) return false;
-  return true;
+  return !tankBlockedAt(t.cx+DX[d]*20, t.cy+DY[d]*20);
 }
 
 /* ===================== 敌军 AI ===================== */
@@ -271,11 +272,23 @@ function aiPick(e){
   // 80% 朝玩家, 20% 朝基地
   const target=Math.random()<0.8?player:{cx:6*CELL+CELL/2,cy:12*CELL+CELL/2};
   const dx=target.cx-e.cx, dy=target.cy-e.cy;
-  let pref=Math.abs(dx)>Math.abs(dy)?(dx>0?D.RIGHT:D.LEFT):(dy>0?D.DOWN:D.UP);
-  if(Math.random()<0.3) pref=(pref+1+(Math.random()*2|0))%4;
-  const order=[pref,(pref+1)%4,(pref+3)%4,(pref+2)%4];
-  for(const d of order) if(canStep(e,d)){ e.dir=d; return; }
-  e.dir=order[3];
+  const pref=Math.abs(dx)>Math.abs(dy)?(dx>0?D.RIGHT:D.LEFT):(dy>0?D.DOWN:D.UP);
+  // 加权随机选路: 朝目标 0.6 / 两侧各 0.17 / 反向 0.1
+  // 再惩罚"刚被挡住的方向"和"原路返回的方向", 避免在死胡同里来回震荡
+  // 顶部三行内额外强化向下, 让敌军尽快离开出生区进入战场
+  const w=[0.1,0.1,0.1,0.1];
+  w[pref]=0.6; w[(pref+1)%4]=0.17; w[(pref+3)%4]=0.17;
+  if(e.cy<CELL*3) w[D.DOWN]*=1.5;
+  if(e.lastBlocked!==undefined) w[e.lastBlocked]*=0.25;
+  w[(e.dir+2)%4]*=0.2;
+  const pass=[];
+  for(let d=0;d<4;d++) if(canStep(e,d)) pass.push(d);
+  if(!pass.length){ e.dir=(e.dir+2)%4; return; }
+  let total=0;
+  for(const d of pass) total+=w[d];
+  let r=Math.random()*total;
+  for(const d of pass){ r-=w[d]; if(r<=0){ e.dir=d; return; } }
+  e.dir=pass[pass.length-1];
 }
 
 function enemyShoot(e){ shoot(e,false); }
@@ -485,10 +498,11 @@ function updateEnemies(dt){
     const bx=e.cx, by=e.cy;
     moveTank(e,dt);
     if(Math.abs(e.cx-bx)+Math.abs(e.cy-by)<0.5) e.stuck=(e.stuck||0)+dt;
-    else e.stuck=0;
-    if(e.think<=0||e.stuck>0.45){
+    else { e.stuck=0; e.lastBlocked=undefined; }
+    if(e.think<=0||e.stuck>0.5){
+      if(e.stuck>0.5) e.lastBlocked=e.dir;
       aiPick(e);
-      e.think=0.4+Math.random()*1.2;
+      e.think=1.5+Math.random()*2;
       e.stuck=0;
     }
     e.cd-=dt;
